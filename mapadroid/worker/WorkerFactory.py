@@ -1,12 +1,13 @@
 import asyncio
-from typing import Optional, NamedTuple
+from typing import NamedTuple, Optional
 
 from mapadroid.db.DbWrapper import DbWrapper
 from mapadroid.mitm_receiver.MitmMapper import MitmMapper
 from mapadroid.ocr.pogoWindows import PogoWindows
-from mapadroid.utils.MappingManager import MappingManager
 from mapadroid.utils.collections import Location
+from mapadroid.utils.logging import LoggerEnums, get_logger, get_origin_logger
 from mapadroid.utils.madGlobals import WrongAreaInWalker
+from mapadroid.utils.MappingManager import MappingManager
 from mapadroid.utils.routeutil import pre_check_value
 from mapadroid.websocket.AbstractCommunicator import AbstractCommunicator
 from mapadroid.worker.AbstractWorker import AbstractWorker
@@ -14,8 +15,6 @@ from mapadroid.worker.WorkerConfigmode import WorkerConfigmode
 from mapadroid.worker.WorkerMITM import WorkerMITM
 from mapadroid.worker.WorkerQuests import WorkerQuests
 from mapadroid.worker.WorkerType import WorkerType
-from mapadroid.utils.logging import get_logger, LoggerEnums, get_origin_logger
-
 
 logger = get_logger(LoggerEnums.worker)
 
@@ -65,7 +64,7 @@ class WorkerFactory:
         origin_logger = get_origin_logger(logger, origin=origin)
         walker_area_array = client_mapping.get("walker", None)
         if walker_area_array is None:
-            logger.error("No valid walker could be found for {}", origin)
+            logger.warning("No valid walker could be found for {}", origin)
             return None
 
         if devicesettings is not None and "walker_area_index" not in devicesettings:
@@ -83,9 +82,9 @@ class WorkerFactory:
         while not pre_check_value(walker_settings, self.__event.get_current_event_id()) \
                 and walker_index < len(walker_area_array):
             origin_logger.info('not using area {} - Walkervalue out of range',
-                        self.__mapping_manager.routemanager_get_name(walker_area_name))
+                               self.__mapping_manager.routemanager_get_name(walker_area_name))
             if walker_index >= len(walker_area_array) - 1:
-                origin_logger.error('Can NOT find any active area defined for current time. Check Walker entries')
+                origin_logger.warning('Cannot find any active area defined for current time. Check Walker entries')
                 walker_index = 0
                 self.__mapping_manager.set_devicesetting_value_of(origin, 'walker_area_index',
                                                                   walker_index)
@@ -110,7 +109,6 @@ class WorkerFactory:
 
     async def __prep_settings(self, origin: str) -> Optional[WalkerConfiguration]:
         origin_logger = get_origin_logger(logger, origin=origin)
-        last_known_state = {}
         client_mapping = self.__mapping_manager.get_devicemappings_of(origin)
         devicesettings = self.__mapping_manager.get_devicesettings_of(origin)
         origin_logger.info("Setting up routemanagers")
@@ -153,7 +151,7 @@ class WorkerFactory:
         # TODO: get worker
         walker_configuration: Optional[WalkerConfiguration] = await self.__prep_settings(origin)
         if walker_configuration is None:
-            origin_logger.error("Failed to find a walker configuration")
+            origin_logger.warning("Failed to find a walker configuration")
             return None
         origin_logger.debug("Setting up worker")
         await self.__update_settings_of_origin(origin, walker_configuration)
@@ -179,7 +177,8 @@ class WorkerFactory:
         if origin is None or worker_type is None or worker_type == WorkerType.UNDEFINED:
             return None
         elif worker_type in [WorkerType.CONFIGMODE, WorkerType.CONFIGMODE.value]:
-            origin_logger.error("WorkerFactory::get_worker called with configmode arg, use get_configmode_worker instead")
+            origin_logger.error("WorkerFactory::get_worker called with configmode arg, use get_configmode_worker"
+                                "instead")
             return None
         # TODO: validate all values
         elif worker_type in [WorkerType.IV_MITM, WorkerType.IV_MITM.value,
@@ -217,4 +216,3 @@ class WorkerFactory:
                                   routemanager_name=None,
                                   event=self.__event)
         return worker
-

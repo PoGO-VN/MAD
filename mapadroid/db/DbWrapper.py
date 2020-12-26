@@ -3,18 +3,18 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from functools import reduce
-from typing import List, Optional
-from mapadroid.db.DbSchemaUpdater import DbSchemaUpdater
+from typing import Dict, List, Optional, Tuple
+
 from mapadroid.db.DbPogoProtoSubmit import DbPogoProtoSubmit
 from mapadroid.db.DbSanityCheck import DbSanityCheck
+from mapadroid.db.DbSchemaUpdater import DbSchemaUpdater
 from mapadroid.db.DbStatsReader import DbStatsReader
 from mapadroid.db.DbStatsSubmit import DbStatsSubmit
 from mapadroid.db.DbWebhookReader import DbWebhookReader
 from mapadroid.geofence.geofenceHelper import GeofenceHelper
 from mapadroid.utils.collections import Location
+from mapadroid.utils.logging import LoggerEnums, get_logger
 from mapadroid.utils.s2Helper import S2Helper
-from mapadroid.utils.logging import get_logger, LoggerEnums
-
 
 logger = get_logger(LoggerEnums.database)
 
@@ -24,7 +24,6 @@ class DbWrapper:
         self._db_exec = db_exec
         self.application_args = args
         self._event_id: int = 1
-        self._event_lure_duration: int = 30
 
         self.sanity_check: DbSanityCheck = DbSanityCheck(db_exec)
         self.sanity_check.check_all()
@@ -37,16 +36,13 @@ class DbWrapper:
         self.webhook_reader: DbWebhookReader = DbWebhookReader(db_exec, self)
         try:
             self.get_instance_id()
-        except:
+        except Exception:
             self.instance_id = None
             logger.warning('Unable to get instance id from the database.  If this is a new instance and the DB is not '
                            'installed, this message is safe to ignore')
 
     def set_event_id(self, eventid: int):
         self._event_id = eventid
-
-    def set_event_lure_duration(self, lureduration: int):
-        self._event_lure_duration = lureduration
 
     def close(self, conn, cursor):
         return self._db_exec.close(conn, cursor)
@@ -74,10 +70,16 @@ class DbWrapper:
         """
         return self._db_exec.autofetch_column(sql, args=args, **kwargs)
 
-    def autoexec_delete(self, table, keyvals, literals=[], where_append=[], **kwargs):
+    def autoexec_delete(self, table, keyvals, literals=None, where_append=None, **kwargs):
+        if where_append is None:
+            where_append = []
+        if literals is None:
+            literals = []
         return self._db_exec.autoexec_delete(table, keyvals, literals=literals, where_append=where_append, **kwargs)
 
-    def autoexec_insert(self, table, keyvals, literals=[], optype="INSERT", **kwargs):
+    def autoexec_insert(self, table, keyvals, literals=None, optype="INSERT", **kwargs):
+        if literals is None:
+            literals = []
         return self._db_exec.autoexec_insert(table, keyvals, literals=literals, optype=optype, **kwargs)
 
     def autoexec_update(self, table, set_keyvals, **kwargs):
@@ -91,11 +93,11 @@ class DbWrapper:
         unixtime = (dt - datetime(1970, 1, 1)).total_seconds()
         return unixtime
 
-    def get_next_raid_hatches(self, delay_after_hatch, geofence_helper=None):
+    def get_next_raid_hatches(self, geofence_helper=None):
         """
         In order to build a priority queue, we need to be able to check for the next hatches of raid eggs
         The result may not be sorted by priority, to be done at a higher level!
-        :return: unsorted list of next hatches within delay_after_hatch
+        :return: unsorted list of next hatches
         """
         logger.debug3("DbWrapper::get_next_raid_hatches called")
         db_time_to_check = datetime.utcfromtimestamp(
@@ -106,29 +108,27 @@ class DbWrapper:
             "FROM raid "
             "LEFT JOIN gym ON raid.gym_id = gym.gym_id WHERE raid.end > %s AND raid.pokemon_id IS NULL"
         )
-        vals = (
+        sql_args = (
             db_time_to_check,
         )
 
-        res = self.execute(query, vals)
+        res = self.execute(query, sql_args)
         data = []
         for (start, latitude, longitude) in res:
             if latitude is None or longitude is None:
                 logger.warning("lat or lng is none")
                 continue
-            elif geofence_helper and not geofence_helper.is_coord_inside_include_geofence(
-                    [latitude, longitude]):
+            elif geofence_helper and not geofence_helper.is_coord_inside_include_geofence([latitude, longitude]):
                 logger.debug3("Excluded hatch at {}, {} since the coordinate is not inside the given include fences",
-                    str(latitude), str(longitude))
+                              latitude, longitude)
                 continue
             timestamp = self.__db_timestring_to_unix_timestamp(str(start))
-            data.append((timestamp + delay_after_hatch,
-                         Location(latitude, longitude)))
+            data.append((timestamp, Location(latitude, longitude)))
 
         logger.debug4("Latest Q: {}", data)
         return data
 
-    def set_scanned_location(self, lat, lng, capture_time):
+    def set_scanned_location(self, lat, lng):
         """
         Update scannedlocation (in RM) of a given lat/lng
         """
@@ -143,8 +143,8 @@ class DbWrapper:
             "ON DUPLICATE KEY UPDATE last_modified=VALUES(last_modified)"
         )
         # TODO: think of a better "unique, real number"
-        vals = (cell_id, lat, lng, now, -1, -1, -1, -1, -1, -1, -1, -1)
-        self.execute(query, vals, commit=True)
+        sql_args = (cell_id, lat, lng, now, -1, -1, -1, -1, -1, -1, -1, 0)
+        self.execute(query, sql_args, commit=True)
 
         return True
 
@@ -240,9 +240,9 @@ class DbWrapper:
         encounter_id_coords = geofence_helper.get_geofenced_coordinates(
             list_of_coords)
         logger.debug3("Got {} encounter coordinates within this rect and age (minLat, minLon, maxLat, maxLon, "
-                     "last_modified): {}", len(encounter_id_coords), params)
+                      "last_modified): {}", len(encounter_id_coords), params)
         encounter_id_infos = {}
-        for (latitude, longitude, encounter_id, disappear_time, last_modified) in encounter_id_coords:
+        for (_latitude, _longitude, encounter_id, disappear_time, _last_modified) in encounter_id_coords:
             encounter_id_infos[encounter_id] = disappear_time
 
         return latest, encounter_id_infos
@@ -254,10 +254,10 @@ class DbWrapper:
         """
         logger.debug3("DbWrapper::stops_from_db called")
 
-        minLat, minLon, maxLat, maxLon = -90, -180, 90, 180
+        min_lat, min_lon, max_lat, max_lon = -90, -180, 90, 180
         query_where: str = ""
         if geofence_helper is not None:
-            minLat, minLon, maxLat, maxLon = geofence_helper.get_polygon_from_fence()
+            min_lat, min_lon, max_lat, max_lon = geofence_helper.get_polygon_from_fence()
 
         if fence is not None:
             query_where = " and ST_CONTAINS(ST_GEOMFROMTEXT( 'POLYGON(( {} ))'), " \
@@ -268,7 +268,7 @@ class DbWrapper:
             "FROM pokestop "
             "WHERE (latitude >= {} AND longitude >= {} "
             "AND latitude <= {} AND longitude <= {}) "
-        ).format(minLat, minLon, maxLat, maxLon)
+        ).format(min_lat, min_lon, max_lat, max_lon)
 
         query = query + str(query_where)
 
@@ -284,8 +284,8 @@ class DbWrapper:
         else:
             return list_of_coords
 
-    def quests_from_db(self, neLat=None, neLon=None, swLat=None, swLon=None, oNeLat=None, oNeLon=None,
-                       oSwLat=None, oSwLon=None, timestamp=None, fence=None):
+    def quests_from_db(self, ne_lat=None, ne_lon=None, sw_lat=None, sw_lon=None, o_ne_lat=None, o_ne_lon=None,
+                       o_sw_lat=None, o_sw_lon=None, timestamp=None, fence=None):
         """
         Retrieve all the pokestops valid within the area set by geofence_helper
         :return: numpy array with coords
@@ -306,19 +306,19 @@ class DbWrapper:
 
         query_where = ""
 
-        if neLat is not None and neLon is not None and swLat is not None and swLon is not None:
+        if ne_lat is not None and ne_lon is not None and sw_lat is not None and sw_lon is not None:
             oquery_where = (
                 " AND (latitude >= {} AND longitude >= {} "
                 " AND latitude <= {} AND longitude <= {}) "
-            ).format(swLat, swLon, neLat, neLon)
+            ).format(sw_lat, sw_lon, ne_lat, ne_lon)
 
             query_where = query_where + oquery_where
 
-        if oNeLat is not None and oNeLon is not None and oSwLat is not None and oSwLon is not None:
+        if o_ne_lat is not None and o_ne_lon is not None and o_sw_lat is not None and o_sw_lon is not None:
             oquery_where = (
                 " AND NOT (latitude >= {} AND longitude >= {} "
                 " AND latitude <= {} AND longitude <= {}) "
-            ).format(oSwLat, oSwLon, oNeLat, oNeLon)
+            ).format(o_sw_lat, o_sw_lon, o_ne_lat, o_ne_lon)
 
             query_where = query_where + oquery_where
         elif timestamp is not None:
@@ -362,8 +362,8 @@ class DbWrapper:
             query_where = ' where disappear_time > \'%s\' ' % str(hours)
 
         query = (
-                "SELECT pokemon_id, count(pokemon_id) from pokemon %s group by pokemon_id" % str(
-            query_where)
+            "SELECT pokemon_id, COUNT(pokemon_id) FROM pokemon %s GROUP BY pokemon_id" % str(
+                query_where)
         )
 
         res = self.execute(query)
@@ -392,14 +392,14 @@ class DbWrapper:
             "ORDER BY expire ASC"
         )
 
-        vals = (
+        sql_args = (
             int(min_time_left_seconds),
         )
 
-        results = self.execute(query, vals, commit=False)
+        results = self.execute(query, sql_args, commit=False)
 
         next_to_encounter = []
-        for latitude, longitude, encounter_id, spawnpoint_id, pokemon_id, expire in results:
+        for latitude, longitude, encounter_id, _spawnpoint_id, pokemon_id, _ in results:
             if pokemon_id not in eligible_mon_ids:
                 continue
             elif latitude is None or longitude is None:
@@ -423,23 +423,32 @@ class DbWrapper:
             i += 1
         return to_be_encountered
 
-    def stop_from_db_without_quests(self, geofence_helper):
+    def stop_from_db_without_quests(self, geofence_helper, latlng=True):
         logger.debug3("DbWrapper::stop_from_db_without_quests called")
+        fields = "pokestop.latitude, pokestop.longitude"
 
-        minLat, minLon, maxLat, maxLon = geofence_helper.get_polygon_from_fence()
+        min_lat, min_lon, max_lat, max_lon = geofence_helper.get_polygon_from_fence()
+        if not latlng:
+            fields = "pokestop.pokestop_id"
 
         query = (
-            "SELECT pokestop.latitude, pokestop.longitude "
+            "SELECT " + fields + " "
             "FROM pokestop "
             "LEFT JOIN trs_quest ON pokestop.pokestop_id = trs_quest.GUID "
             "WHERE (pokestop.latitude >= {} AND pokestop.longitude >= {} "
             "AND pokestop.latitude <= {} AND pokestop.longitude <= {}) "
             "AND (DATE(from_unixtime(trs_quest.quest_timestamp,'%Y-%m-%d')) <> CURDATE() "
             "OR trs_quest.GUID IS NULL)"
-        ).format(minLat, minLon, maxLat, maxLon)
+        ).format(min_lat, min_lon, max_lat, max_lon)
 
         res = self.execute(query)
         list_of_coords: List[Location] = []
+
+        if not latlng:
+            list_of_ids: List = []
+            for stopid in res:
+                list_of_ids.append(''.join(stopid))
+            return list_of_ids
 
         for (latitude, longitude) in res:
             list_of_coords.append(Location(latitude, longitude))
@@ -452,7 +461,7 @@ class DbWrapper:
 
     def any_stops_unvisited(self, geofence_helper: GeofenceHelper, origin: str):
         logger.debug3("DbWrapper::any_stops_unvisited called")
-        minLat, minLon, maxLat, maxLon = geofence_helper.get_polygon_from_fence()
+        min_lat, min_lon, max_lat, max_lon = geofence_helper.get_polygon_from_fence()
         query = (
             "SELECT pokestop.latitude, pokestop.longitude "
             "FROM pokestop "
@@ -460,7 +469,7 @@ class DbWrapper:
             "WHERE pokestop.latitude >= {} AND pokestop.longitude >= {} "
             "AND pokestop.latitude <= {} AND pokestop.longitude <= {} "
             "AND trs_visited.origin IS NULL LIMIT 1"
-        ).format(origin, minLat, minLon, maxLat, maxLon)
+        ).format(origin, min_lat, min_lon, max_lat, max_lon)
 
         res = self.execute(query)
         unvisited: List[Location] = []
@@ -475,7 +484,7 @@ class DbWrapper:
 
     def stops_from_db_unvisited(self, geofence_helper: GeofenceHelper, origin: str):
         logger.debug3("DbWrapper::stops_from_db_unvisited called")
-        minLat, minLon, maxLat, maxLon = geofence_helper.get_polygon_from_fence()
+        min_lat, min_lon, max_lat, max_lon = geofence_helper.get_polygon_from_fence()
         query = (
             "SELECT pokestop.latitude, pokestop.longitude "
             "FROM pokestop "
@@ -483,7 +492,7 @@ class DbWrapper:
             "WHERE pokestop.latitude >= {} AND pokestop.longitude >= {} "
             "AND pokestop.latitude <= {} AND pokestop.longitude <= {} "
             "AND trs_visited.origin IS NULL"
-        ).format(origin, minLat, minLon, maxLat, maxLon)
+        ).format(origin, min_lat, min_lon, max_lat, max_lon)
 
         res = self.execute(query)
         unvisited: List[Location] = []
@@ -497,8 +506,8 @@ class DbWrapper:
         else:
             return unvisited
 
-    def get_gyms_in_rectangle(self, neLat, neLon, swLat, swLon, oNeLat=None, oNeLon=None, oSwLat=None,
-                              oSwLon=None, timestamp=None):
+    def get_gyms_in_rectangle(self, ne_lat, ne_lon, sw_lat, sw_lon, o_ne_lat=None, o_ne_lon=None, o_sw_lat=None,
+                              o_sw_lon=None, timestamp=None):
         """
         Basically just for MADmin map. This method returns gyms within a certain rectangle.
         It also handles a diff/old area to reduce returned data. Also checks for updated
@@ -511,7 +520,8 @@ class DbWrapper:
             "SELECT gym.gym_id, gym.latitude, gym.longitude, "
             "gymdetails.name, gymdetails.url, gym.team_id, "
             "gym.last_modified, raid.level, raid.spawn, raid.start, "
-            "raid.end, raid.pokemon_id, raid.form, gym.last_scanned "
+            "raid.end, raid.pokemon_id, raid.form, raid.costume, "
+            "raid.evolution, gym.last_scanned "
             "FROM gym "
             "INNER JOIN gymdetails ON gym.gym_id = gymdetails.gym_id "
             "LEFT JOIN raid ON raid.gym_id = gym.gym_id "
@@ -521,14 +531,14 @@ class DbWrapper:
         query_where = (
             " WHERE (latitude >= {} AND longitude >= {} "
             " AND latitude <= {} AND longitude <= {}) "
-        ).format(swLat, swLon, neLat, neLon)
+        ).format(sw_lat, sw_lon, ne_lat, ne_lon)
 
         # but don't fetch gyms from a known rectangle
-        if oNeLat is not None and oNeLon is not None and oSwLat is not None and oSwLon is not None:
+        if o_ne_lat is not None and o_ne_lon is not None and o_sw_lat is not None and o_sw_lon is not None:
             oquery_where = (
                 " AND NOT (latitude >= {} AND longitude >= {} "
                 " AND latitude <= {} AND longitude <= {}) "
-            ).format(oSwLat, oSwLon, oNeLat, oNeLon)
+            ).format(o_sw_lat, o_sw_lon, o_ne_lat, o_ne_lon)
 
             query_where = query_where + oquery_where
 
@@ -546,9 +556,9 @@ class DbWrapper:
         res = self.execute(query + query_where)
 
         for (gym_id, latitude, longitude, name, url, team_id, last_updated,
-             level, spawn, start, end, mon_id, form, last_scanned) in res:
+             level, spawn, start, end, mon_id, form, costume, evolution, last_scanned) in res:
 
-            nowts = datetime.utcfromtimestamp(time.time()).timestamp()
+            nowts = datetime.now(tz=timezone.utc).timestamp()
 
             # check if we found a raid and if it's still active
             if end is None or nowts > int(end.replace(tzinfo=timezone.utc).timestamp()):
@@ -560,7 +570,9 @@ class DbWrapper:
                     "end": int(end.replace(tzinfo=timezone.utc).timestamp()),
                     "mon": mon_id,
                     "form": form,
-                    "level": level
+                    "level": level,
+                    "costume": costume,
+                    "evolution": evolution
                 }
 
             gyms[gym_id] = {
@@ -577,8 +589,8 @@ class DbWrapper:
 
         return gyms
 
-    def get_mons_in_rectangle(self, neLat, neLon, swLat, swLon, oNeLat=None, oNeLon=None, oSwLat=None,
-                              oSwLon=None, timestamp=None):
+    def get_mons_in_rectangle(self, ne_lat, ne_lon, sw_lat, sw_lon, o_ne_lat=None, o_ne_lon=None, o_sw_lat=None,
+                              o_sw_lon=None, timestamp=None):
         mons = []
 
         now = datetime.utcfromtimestamp(time.time()).strftime("%Y-%m-%d %H:%M:%S")
@@ -596,13 +608,13 @@ class DbWrapper:
         query_where = (
             " AND (latitude >= {} AND longitude >= {} "
             " AND latitude <= {} AND longitude <= {}) "
-        ).format(swLat, swLon, neLat, neLon)
+        ).format(sw_lat, sw_lon, ne_lat, ne_lon)
 
-        if oNeLat is not None and oNeLon is not None and oSwLat is not None and oSwLon is not None:
+        if o_ne_lat is not None and o_ne_lon is not None and o_sw_lat is not None and o_sw_lon is not None:
             oquery_where = (
                 " AND NOT (latitude >= {} AND longitude >= {} "
                 " AND latitude <= {} AND longitude <= {}) "
-            ).format(oSwLat, oSwLon, oNeLat, oNeLon)
+            ).format(o_sw_lat, o_sw_lon, o_ne_lat, o_ne_lon)
 
             query_where = query_where + oquery_where
 
@@ -645,36 +657,34 @@ class DbWrapper:
 
         return mons
 
-    def get_stops_in_rectangle(self, neLat, neLon, swLat, swLon, oNeLat=None, oNeLon=None, oSwLat=None,
-                               oSwLon=None,
-                               timestamp=None, check_quests=False):
-        stops = {}
+    def get_stops_in_rectangle(self, ne_lat, ne_lon, sw_lat, sw_lon, o_ne_lat=None, o_ne_lon=None, o_sw_lat=None,
+                               o_sw_lon=None, timestamp=None):
         args = []
         conversions = ['ps.`last_modified`', 'ps.`lure_expiration`', 'ps.`last_updated`',
                        'ps.`incident_start`',
                        'ps.`incident_expiration`']
         # base query to fetch stops
         query = (
-            "SELECT ps.`pokestop_id`, ps.`enabled`, ps.`latitude`, ps.`longitude`,\n" \
-            "%s,\n" \
-            "%s,\n" \
-            "%s,\n" \
-            "%s,\n" \
-            "%s,\n" \
-            "ps.`active_fort_modifier`, ps.`name`, ps.`image`, ps.`incident_grunt_type`\n" \
-            "FROM pokestop ps\n" \
-            )
+            "SELECT ps.`pokestop_id`, ps.`enabled`, ps.`latitude`, ps.`longitude`,\n"
+            "%s,\n"
+            "%s,\n"
+            "%s,\n"
+            "%s,\n"
+            "%s,\n"
+            "ps.`active_fort_modifier`, ps.`name`, ps.`image`, ps.`incident_grunt_type`\n"
+            "FROM pokestop ps\n"
+        )
         query_where = (
             "WHERE (ps.`latitude` >= %%s AND ps.`longitude` >= %%s "
             " AND ps.`latitude` <= %%s AND ps.`longitude` <= %%s) "
         )
-        args += [swLat, swLon, neLat, neLon]
-        if oNeLat is not None and oNeLon is not None and oSwLat is not None and oSwLon is not None:
+        args += [sw_lat, sw_lon, ne_lat, ne_lon]
+        if o_ne_lat is not None and o_ne_lon is not None and o_sw_lat is not None and o_sw_lon is not None:
             oquery_where = (
                 " AND NOT (ps.`latitude` >= %%s AND ps.`longitude` >= %%s "
                 " AND ps.`latitude` <= %%s AND ps.`longitude` <= %%s) "
             )
-            args += [oSwLat, oSwLon, oNeLat, oNeLon]
+            args += [o_sw_lat, o_sw_lon, o_ne_lat, o_ne_lon]
             query_where = query_where + oquery_where
         elif timestamp is not None:
             tsdt = datetime.utcfromtimestamp(int(timestamp)).strftime("%Y-%m-%d %H:%M:%S")
@@ -687,19 +697,28 @@ class DbWrapper:
         sql = query + query_where
         pokestops = self.autofetch_all(sql % tuple(conversion_txt), args=tuple(args))
         quests = self.quests_from_db(
-            neLat=neLat,
-            neLon=neLon,
-            swLat=swLat,
-            swLon=swLon,
-            oNeLat=oNeLat,
-            oNeLon=oNeLon,
-            oSwLat=oSwLat,
-            oSwLon=oSwLon,
+            ne_lat=ne_lat,
+            ne_lon=ne_lon,
+            sw_lat=sw_lat,
+            sw_lon=sw_lon,
+            o_ne_lat=o_ne_lat,
+            o_ne_lon=o_ne_lon,
+            o_sw_lat=o_sw_lat,
+            o_sw_lon=o_sw_lon,
             timestamp=timestamp
         )
         for pokestop in pokestops:
             pokestop['has_quest'] = pokestop['pokestop_id'] in quests
         return pokestops
+
+    def update_pokestop_location(self, fort_id: str, latitude: float, longitude: float) -> None:
+        query = (
+            "UPDATE pokestop "
+            "SET latitude = %s, longitude = %s "
+            "WHERE pokestop_id = %s"
+        )
+        update_vars = (latitude, longitude, fort_id)
+        self.execute(query, update_vars, commit=True)
 
     def delete_stop(self, latitude: float, longitude: float):
         logger.debug3('Deleting stop from db')
@@ -723,9 +742,9 @@ class DbWrapper:
     def get_detected_spawns(self, geofence_helper, include_event_id) -> List[Location]:
         logger.debug3("DbWrapper::get_detected_spawns called")
 
-        minLat, minLon, maxLat, maxLon = geofence_helper.get_polygon_from_fence()
+        min_lat, min_lon, max_lat, max_lon = geofence_helper.get_polygon_from_fence()
         event_ids: list = []
-        #adding default spawns
+        # adding default spawns
         event_ids.append(1)
 
         if include_event_id is not None:
@@ -737,7 +756,7 @@ class DbWrapper:
             "WHERE (latitude >= {} AND longitude >= {} "
             "AND latitude <= {} AND longitude <= {}) and "
             "eventid in ({})"
-        ).format(minLat, minLon, maxLat, maxLon, str(', '.join(str(v) for v in event_ids)))
+        ).format(min_lat, min_lon, max_lat, max_lon, str(', '.join(str(v) for v in event_ids)))
 
         list_of_coords: List[Location] = []
         logger.debug3("DbWrapper::get_detected_spawns executing select query")
@@ -759,7 +778,7 @@ class DbWrapper:
     def get_undetected_spawns(self, geofence_helper, include_event_id):
         logger.debug3("DbWrapper::get_undetected_spawns called")
 
-        minLat, minLon, maxLat, maxLon = geofence_helper.get_polygon_from_fence()
+        min_lat, min_lon, max_lat, max_lon = geofence_helper.get_polygon_from_fence()
         event_ids: list = []
         # adding default spawns
         event_ids.append(1)
@@ -774,7 +793,7 @@ class DbWrapper:
             "AND latitude <= {} AND longitude <= {}) and "
             "calc_endminsec is NULL and "
             "eventid in ({})"
-        ).format(minLat, minLon, maxLat, maxLon, str(', '.join(str(v) for v in event_ids)))
+        ).format(min_lat, min_lon, max_lat, max_lon, str(', '.join(str(v) for v in event_ids)))
 
         list_of_coords: List[Location] = []
         logger.debug3("DbWrapper::get_undetected_spawns executing select query")
@@ -862,8 +881,8 @@ class DbWrapper:
 
         return spawn
 
-    def download_spawns(self, neLat=None, neLon=None, swLat=None, swLon=None, oNeLat=None, oNeLon=None,
-                        oSwLat=None, oSwLon=None, timestamp=None, fence=None, eventid=None, todayonly=False,
+    def download_spawns(self, ne_lat=None, ne_lon=None, sw_lat=None, sw_lon=None, o_ne_lat=None, o_ne_lon=None,
+                        o_sw_lat=None, o_sw_lon=None, timestamp=None, fence=None, eventid=None, todayonly=False,
                         olderthanxdays=None):
         logger.debug3("dbWrapper::download_spawns")
         spawn = {}
@@ -877,17 +896,17 @@ class DbWrapper:
             "FROM `trs_spawn` inner join trs_event on trs_event.id = trs_spawn.eventid "
         )
 
-        if neLat is not None:
+        if ne_lat is not None:
             query_where = (
                 " WHERE (latitude >= {} AND longitude >= {} "
                 " AND latitude <= {} AND longitude <= {}) "
-            ).format(swLat, swLon, neLat, neLon)
+            ).format(sw_lat, sw_lon, ne_lat, ne_lon)
 
-        if oNeLat is not None and oNeLon is not None and oSwLat is not None and oSwLon is not None:
+        if o_ne_lat is not None and o_ne_lon is not None and o_sw_lat is not None and o_sw_lon is not None:
             query_where += (
                 " AND NOT (latitude >= {} AND longitude >= {} "
                 " AND latitude <= {} AND longitude <= {}) "
-            ).format(oSwLat, oSwLon, oNeLat, oNeLon)
+            ).format(o_sw_lat, o_sw_lon, o_ne_lat, o_ne_lon)
 
         elif timestamp is not None:
             tsdt = datetime.utcfromtimestamp(int(timestamp)).strftime("%Y-%m-%d %H:%M:%S")
@@ -915,8 +934,8 @@ class DbWrapper:
         query += query_where
         res = self.execute(query)
 
-        for (spawnid, lat, lon, endtime, spawndef, last_scanned, first_detection, last_non_scanned, eventname, eventid) \
-                in res:
+        for (spawnid, lat, lon, endtime, spawndef, last_scanned, first_detection, last_non_scanned, eventname,
+             eventid) in res:
             spawn[spawnid] = {
                 'id': spawnid,
                 'lat': lat,
@@ -942,7 +961,7 @@ class DbWrapper:
         logger.debug3("DbWrapper::retrieve_next_spawns called")
 
         current_time_of_day = datetime.now().replace(microsecond=0)
-        minLat, minLon, maxLat, maxLon = geofence_helper.get_polygon_from_fence()
+        min_lat, min_lon, max_lat, max_lon = geofence_helper.get_polygon_from_fence()
 
         query = (
             "SELECT latitude, longitude, spawndef, calc_endminsec "
@@ -950,7 +969,7 @@ class DbWrapper:
             "WHERE calc_endminsec IS NOT NULL "
             "AND (latitude >= {} AND longitude >= {} AND latitude <= {} AND longitude <= {}) "
             "AND eventid in (1, {})"
-        ).format(minLat, minLon, maxLat, maxLon, self._event_id)
+        ).format(min_lat, min_lon, max_lat, max_lon, self._event_id)
 
         res = self.execute(query)
         next_up = []
@@ -974,23 +993,46 @@ class DbWrapper:
 
             spawn_duration_minutes = 60 if spawndef == 15 else 30
 
-            timestamp = time.mktime(temp_date.timetuple()) - \
-                        spawn_duration_minutes * 60
+            timestamp = time.mktime(temp_date.timetuple()) - spawn_duration_minutes * 60
             # check if we calculated a time in the past, if so, add an hour to it...
             timestamp = timestamp + 60 * 60 if timestamp < current_time else timestamp
-            # TODO: consider the following since I am not sure if the prio Q clustering handles stuff properly yet
-            # if timestamp >= current_time + 600:
-            #     # let's skip monspawns that are more than 10minutes in the future
-            #     continue
-            next_up.append(
-                (
-                    timestamp, Location(latitude, longitude)
-                )
-            )
+            next_up.append((timestamp, Location(latitude, longitude)))
         return next_up
 
+    def get_stop_ids_and_locations_nearby(self, location: Location, max_distance: int = 0.5) \
+            -> Dict[str, Tuple[Location, datetime]]:
+        """
+        Fetch the IDs and the stops' locations from DB around the given location with a radius of distance passed
+        Args:
+            location:
+            max_distance: Radius around location to return stops within (in kilometers)
+
+        Returns:
+
+        """
+        if max_distance < 0:
+            logger.warning("Cannot search for stops at negative range...")
+            return {}
+
+        query = (
+            "SELECT pokestop_id, latitude, longitude, last_updated "
+            "FROM pokestop "
+            "WHERE SQRT(POW(69.1 * (latitude - {}), 2) + POW(69.1 * ({} - longitude), 2)) <= {} "
+        ).format(location.lat, location.lng, max_distance)
+        res = self.execute(query)
+
+        if not res:
+            logger.warning("No stops found closeby to {} in range of {}m", str(location), max_distance)
+            return {}
+
+        stops: Dict[str, Tuple[Location, datetime]] = dict()
+        for (pokestop_id, latitude, longitude, last_updated) in res:
+            stops[pokestop_id] = (Location(latitude, longitude), last_updated)
+
+        return stops
+
     def get_nearest_stops_from_position(self, geofence_helper, origin: str, lat, lon, limit: int = 20,
-                                        ignore_spinned: bool = True, maxdistance: int = 1):
+                                        ignore_spinned: bool = True, maxdistance: int = 1) -> List[Location]:
         """
         Retrieve the nearest stops from lat / lon (optional with limit)
         :return:
@@ -1002,7 +1044,7 @@ class DbWrapper:
         loopcount: int = 0
         getlocations: bool = False
 
-        minLat, minLon, maxLat, maxLon = geofence_helper.get_polygon_from_fence()
+        min_lat, min_lon, max_lat, max_lon = geofence_helper.get_polygon_from_fence()
         if limit > 0:
             limitstr = "limit {}".format(limit)
 
@@ -1013,7 +1055,7 @@ class DbWrapper:
 
             loopcount += 1
             if loopcount >= 10:
-                logger.error("Not getting any new stop - abort")
+                logger.warning("Not getting any new stop - abort")
                 return []
 
             query = (
@@ -1025,14 +1067,14 @@ class DbWrapper:
                 "where SQRT(POW(69.1 * (latitude - {}), 2) + POW(69.1 * ({} - longitude), 2)) <= {} and "
                 "(latitude >= {} AND longitude >= {} AND latitude <= {} AND longitude <= {}) "
                 "{} ORDER BY distance {} "
-            ).format(lat, lon, origin, lat, lon, maxdistance, minLat, minLon, maxLat, maxLon, ignore_spinnedstr,
+            ).format(lat, lon, origin, lat, lon, maxdistance, min_lat, min_lon, max_lat, max_lon, ignore_spinnedstr,
                      limitstr)
 
             res = self.execute(query)
 
             # getting 0 new locations - more distance!
             if len(res) == 0 or len(res) < limit:
-                logger.warning("No location found or getting not enough locations - need more distance")
+                logger.debug("No location found or not getting enough locations - increasing distance")
                 maxdistance += 2
 
             else:
@@ -1041,14 +1083,14 @@ class DbWrapper:
 
                 stops: List[Location] = []
 
-                for (latitude, longitude, distance) in res:
+                for (latitude, longitude, _distance) in res:
                     stops.append(Location(latitude, longitude))
 
                 if geofence_helper is not None:
                     geofenced_coords = geofence_helper.get_geofenced_coordinates(stops)
                     if len(geofenced_coords) == limit:
                         return geofenced_coords
-                    logger.warning("The coords are out of the fence - increase distance")
+                    logger.debug("The coords are out of the fence - increasing distance")
                     if loopcount >= 5:
                         # setting middle of fence as new startposition
                         lat, lon = geofence_helper.get_middle_from_fence()
@@ -1057,7 +1099,7 @@ class DbWrapper:
                 else:
                     return stops
 
-        logger.error("Not getting any new stop - abort")
+        logger.warning("Not getting any new stop - abort")
         return []
 
     def save_last_walker_position(self, origin, lat, lng):
@@ -1066,10 +1108,10 @@ class DbWrapper:
         query = (
             "update settings_device set startcoords_of_walker='%s, %s' where instance_id=%s and name=%s"
         )
-        vals = (
+        insert_values = (
             lat, lng, self.instance_id, origin
         )
-        self.execute(query, vals, commit=True)
+        self.execute(query, insert_values, commit=True)
 
     def insert_usage(self, instance, cpu, mem, garbage, timestamp):
         logger.debug3("dbWrapper::insert_usage")
@@ -1078,10 +1120,10 @@ class DbWrapper:
             "INSERT into trs_usage (instance, cpu, memory, garbage, timestamp) VALUES "
             "(%s, %s, %s, %s, %s)"
         )
-        vals = (
+        insert_values = (
             instance, cpu, mem, garbage, timestamp
         )
-        self.execute(query, vals, commit=True)
+        self.execute(query, insert_values, commit=True)
 
         return
 
@@ -1146,42 +1188,42 @@ class DbWrapper:
         events = self.autofetch_all(sql)
         return events
 
-    def save_event(self, event_name, event_start, event_end, event_lure_duration=30, id=None):
+    def save_event(self, event_name, event_start, event_end, event_lure_duration=30, event_id=None):
         logger.debug3("DbWrapper::save_event called")
-        if id is None:
+        if event_id is None:
             query = (
                 "INSERT INTO trs_event (event_name, event_start, event_end, event_lure_duration) "
                 "VALUES (%s, %s, %s, %s) "
             )
-            vals = (event_name, event_start, event_end, event_lure_duration)
+            sql_args = (event_name, event_start, event_end, event_lure_duration)
         else:
             query = (
                 "UPDATE trs_event set event_name=%s, event_start=%s, event_end=%s, event_lure_duration=%s "
                 "where id=%s"
             )
-            vals = (event_name, event_start, event_end, event_lure_duration, id)
+            sql_args = (event_name, event_start, event_end, event_lure_duration, event_id)
 
-        self.execute(query, vals, commit=True)
+        self.execute(query, sql_args, commit=True)
         return True
 
-    def delete_event(self, id=None):
+    def delete_event(self, event_id=None):
         logger.debug3("DbWrapper::delete_event called")
-        if id is None:
+        if event_id is None:
             return False
         else:
             # delete event
             query = (
                 "DELETE from trs_event where id=%s"
             )
-            vals = (id)
-            self.execute(query, vals, commit=True)
+            sql_args = (event_id)
+            self.execute(query, sql_args, commit=True)
 
             # delete SP with eventid
             query = (
                 "DELETE from trs_spawn where eventid=%s"
             )
-            vals = (id)
-            self.execute(query, vals, commit=True)
+            sql_args = (event_id)
+            self.execute(query, sql_args, commit=True)
         return True
 
     def get_current_event(self):
@@ -1208,16 +1250,16 @@ class DbWrapper:
         sql = "select * " \
               "from trs_event " \
               "where now() between `event_start` and `event_end` and `id`=%s"
-        vals = (eventid)
-        res = self.execute(sql, vals)
+        sql_args = (eventid)
+        res = self.execute(sql, sql_args)
         number_of_rows = len(res)
         if number_of_rows > 0:
             return True
         else:
             return False
 
-    def get_cells_in_rectangle(self, neLat, neLon, swLat, swLon,
-                               oNeLat=None, oNeLon=None, oSwLat=None, oSwLon=None, timestamp=None):
+    def get_cells_in_rectangle(self, ne_lat, ne_lon, sw_lat, sw_lon,
+                               o_ne_lat=None, o_ne_lon=None, o_sw_lat=None, o_sw_lon=None, timestamp=None):
         query = (
             "SELECT id, level, center_latitude, center_longitude, updated "
             "FROM trs_s2cells "
@@ -1226,13 +1268,13 @@ class DbWrapper:
         query_where = (
             " WHERE (center_latitude >= {} AND center_longitude >= {} "
             " AND center_latitude <= {} AND center_longitude <= {}) "
-        ).format(swLat, swLon, neLat, neLon)
+        ).format(sw_lat, sw_lon, ne_lat, ne_lon)
 
-        if oNeLat is not None and oNeLon is not None and oSwLat is not None and oSwLon is not None:
+        if o_ne_lat is not None and o_ne_lon is not None and o_sw_lat is not None and o_sw_lon is not None:
             oquery_where = (
                 " AND NOT (center_latitude >= {} AND center_longitude >= {} "
                 " AND center_latitude <= {} AND center_longitude <= {}) "
-            ).format(oSwLat, oSwLon, oNeLat, oNeLon)
+            ).format(o_sw_lat, o_sw_lon, o_ne_lat, o_ne_lon)
 
             query_where = query_where + oquery_where
 
@@ -1245,9 +1287,9 @@ class DbWrapper:
         res = self.execute(query + query_where)
 
         cells = []
-        for (id, level, center_latitude, center_longitude, updated) in res:
+        for (cell_id, level, center_latitude, center_longitude, updated) in res:
             cells.append({
-                "id": id,
+                "cell_id": cell_id,
                 "level": level,
                 "center_latitude": center_latitude,
                 "center_longitude": center_longitude,
@@ -1282,6 +1324,7 @@ class DbWrapper:
         }
         return self.autoexec_insert('versions', update_data, optype="ON DUPLICATE")
 
+
 def adjust_tz_to_utc(column: str, as_name: str = None) -> str:
     # I would like to use convert_tz but this may not be populated.  Use offsets instead
     is_dst = time.daylight and time.localtime().tm_isdst > 0
@@ -1289,6 +1332,6 @@ def adjust_tz_to_utc(column: str, as_name: str = None) -> str:
     if not as_name:
         try:
             as_name = re.findall(r'(\w+)', column)[-1]
-        except:
+        except Exception:
             as_name = column
     return "UNIX_TIMESTAMP(%s) + %s AS '%s'" % (column, utc_offset, as_name)

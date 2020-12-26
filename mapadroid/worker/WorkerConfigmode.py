@@ -6,16 +6,13 @@ from typing import Optional
 from mapadroid.db.DbWrapper import DbWrapper
 from mapadroid.mitm_receiver.MitmMapper import MitmMapper
 from mapadroid.utils import MappingManager
+from mapadroid.utils.logging import LoggerEnums, get_logger
 from mapadroid.utils.madGlobals import (
-    WebsocketWorkerRemovedException,
-    WebsocketWorkerTimeoutException,
-    InternalStopWorkerException,
-    WebsocketWorkerConnectionClosedException)
+    InternalStopWorkerException, WebsocketWorkerConnectionClosedException,
+    WebsocketWorkerRemovedException, WebsocketWorkerTimeoutException)
 from mapadroid.utils.routeutil import check_walker_value_type
 from mapadroid.websocket.AbstractCommunicator import AbstractCommunicator
 from mapadroid.worker.AbstractWorker import AbstractWorker
-from mapadroid.utils.logging import get_logger, LoggerEnums
-
 
 logger = get_logger(LoggerEnums.worker)
 
@@ -46,27 +43,15 @@ class WorkerConfigmode(AbstractWorker):
             return default_value
         return devicemappings.get("settings", {}).get(key, default_value)
 
-    def get_communicator(self):
-        return self._communicator
-
     def start_worker(self):
-        self.logger.info("Worker started in configmode")
+        self.logger.warning("Worker started in configmode! This is special, configuration only mode - do not expect"
+                            " scans or avatar moving. After you are done with initial configuration remove -cm flag")
         self._mapping_manager.register_worker_to_routemanager(self._routemanager_name, self._origin)
         self.logger.debug("Setting device to idle for routemanager")
         self._db_wrapper.save_idle_status(self._dev_id, True)
         self.logger.debug("Device set to idle for routemanager")
         while self.check_walker() and not self._stop_worker_event.is_set():
-            if self._args.config_mode:
-                time.sleep(10)
-            else:
-                position_type = self._mapping_manager.routemanager_get_position_type(self._routemanager_name,
-                                                                                     self._origin)
-                if position_type is None:
-                    self.logger.warning("Mappings/Routemanagers have changed, stopping worker to be created again")
-                    self._stop_worker_event.set()
-                    time.sleep(1)
-                else:
-                    time.sleep(10)
+            time.sleep(10)
         self.set_devicesettings_value('finished', True)
         self._mapping_manager.unregister_worker_from_routemanager(self._routemanager_name, self._origin)
         try:
@@ -98,9 +83,10 @@ class WorkerConfigmode(AbstractWorker):
         if self._walker is None:
             return True
         walkereventid = self._walker.get('eventid', None)
-        if walkereventid is None: walkereventid = 1
+        if walkereventid is None:
+            walkereventid = 1
         if walkereventid != self._event.get_current_event_id():
-            self.logger.warning("A other Event has started - leaving now")
+            self.logger.info("Another Event has started - leaving now")
             return False
         mode = self._walker['walkertype']
         if mode == "countdown":
@@ -123,7 +109,7 @@ class WorkerConfigmode(AbstractWorker):
                 return False
             return check_walker_value_type(exittime)
         elif mode == "round":
-            self.logger.error("Rounds while sleep - HAHAHAH")
+            self.logger.warning("Rounds while sleep - HAHAHAH")
             return False
         elif mode == "period":
             self.logger.debug("Checking walker mode 'period'")
@@ -168,15 +154,15 @@ class WorkerConfigmode(AbstractWorker):
     def _stop_pogo(self):
         attempts = 0
         stop_result = self._communicator.stop_app("com.nianticlabs.pokemongo")
-        pogoTopmost = self._communicator.is_pogo_topmost()
-        while pogoTopmost:
+        pogo_topmost = self._communicator.is_pogo_topmost()
+        while pogo_topmost:
             attempts += 1
             if attempts > 10:
                 return False
             stop_result = self._communicator.stop_app(
                 "com.nianticlabs.pokemongo")
             time.sleep(1)
-            pogoTopmost = self._communicator.is_pogo_topmost()
+            pogo_topmost = self._communicator.is_pogo_topmost()
         return stop_result
 
     def _start_pogo(self):
@@ -186,17 +172,15 @@ class WorkerConfigmode(AbstractWorker):
 
         if not self._communicator.is_screen_on():
             self._communicator.start_app("de.grennith.rgc.remotegpscontroller")
-            self.logger.warning("Turning screen on")
+            self.logger.info("Turning screen on")
             self._communicator.turn_screen_on()
             time.sleep(self.get_devicesettings_value("post_turn_screen_on_delay", 7))
 
-        start_result = False
         while not pogo_topmost:
             self._mitm_mapper.set_injection_status(self._origin, False)
-            start_result = self._communicator.start_app(
-                "com.nianticlabs.pokemongo")
+            self._communicator.start_app("com.nianticlabs.pokemongo")
             time.sleep(1)
-            pogo_topmost = self._communicator.is_pogo_topmost()
+            self._communicator.is_pogo_topmost()
 
         reached_raidtab = False
         self._wait_pogo_start_delay()
@@ -205,13 +189,13 @@ class WorkerConfigmode(AbstractWorker):
 
     def _wait_for_injection(self):
         self._not_injected_count = 0
-        reboot = self.get_devicesettings_value('reboot', False)
+        reboot = self.get_devicesettings_value('reboot', True)
         injection_thresh_reboot = 'Unlimited'
         if reboot:
             injection_thresh_reboot = int(self.get_devicesettings_value("injection_thresh_reboot", 20))
         while not self._mitm_mapper.get_injection_status(self._origin):
             if reboot and self._not_injected_count >= injection_thresh_reboot:
-                self.logger.error("Nt get injected in time - reboot")
+                self.logger.error("Not injected in time - reboot")
                 self._reboot()
                 return False
             self.logger.info("Didn't receive any data yet. (Retry count: {}/{})", str(self._not_injected_count),
@@ -236,7 +220,7 @@ class WorkerConfigmode(AbstractWorker):
         try:
             start_result = self._communicator.reboot()
         except (WebsocketWorkerRemovedException, WebsocketWorkerConnectionClosedException):
-            self.logger.error("Could not reboot due to client already having disconnected")
+            self.logger.warning("Could not reboot due to client already having disconnected")
             start_result = False
         time.sleep(5)
         self._db_wrapper.save_last_reboot(self._dev_id)
@@ -254,7 +238,3 @@ class WorkerConfigmode(AbstractWorker):
                 raise InternalStopWorkerException
             time.sleep(1)
             delay_count += 1
-
-    def trigger_check_research(self):
-        # not on configmode
-        return

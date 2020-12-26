@@ -1,7 +1,7 @@
 import copy
 from mapadroid.tests import api_base
 from mapadroid.tests import test_variables as global_variables
-from mapadroid.utils.walkerArgs import parseArgs
+from mapadroid.utils.walkerArgs import parse_args
 from unittest import SkipTest
 
 
@@ -138,7 +138,7 @@ class APIArea(api_base.APITestBase):
         self.assertDictEqual(payload, response.json())
 
     def test_recalc(self):
-        args = parseArgs()
+        args = parse_args()
         if args.config_mode:
             raise SkipTest('Config Mode cannt recalculate a route')
         area_obj = super().create_valid_resource('area')
@@ -160,6 +160,25 @@ class APIArea(api_base.APITestBase):
         }
         response = self.api.patch(area_obj['uri'], json=patch)
         expected = {'invalid': [['geofence_excluded', 'Cannot be the same as geofence_included']]}
+        self.assertDictEqual(response.json(), expected)
+        self.assertEqual(response.status_code, 422)
+        self.remove_resources()
+
+    def test_invalid_initlevel_settings(self):
+        payload = {
+            "name": "%s - Test Pokestop Area - %s",
+        }
+        headers = {
+            'X-Mode': 'pokestops'
+        }
+        area_obj, resp = self.creator.create_valid_resource('area', payload=payload, headers=headers)
+        patch = {
+            'init': True,
+            'level': True
+        }
+        response = self.api.patch(area_obj['uri'], json=patch)
+        expected = {'invalid': [['init', 'Cannot have init and level set to True at the same time. '
+                                         'For leveling up init must be set False.']]}
         self.assertDictEqual(response.json(), expected)
         self.assertEqual(response.status_code, 422)
         self.remove_resources()

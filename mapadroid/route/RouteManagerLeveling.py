@@ -1,12 +1,13 @@
 import time
 from typing import List
+
 import numpy as np
+
 from mapadroid.db.DbWrapper import DbWrapper
 from mapadroid.route.RouteManagerBase import RoutePoolEntry
 from mapadroid.route.RouteManagerQuests import RouteManagerQuests
 from mapadroid.utils.collections import Location
-from mapadroid.utils.logging import get_logger, LoggerEnums
-
+from mapadroid.utils.logging import LoggerEnums, get_logger
 
 logger = get_logger(LoggerEnums.routemanager)
 
@@ -169,7 +170,6 @@ class RouteManagerLeveling(RouteManagerQuests):
                 self._prio_queue = None
                 self.delay_after_timestamp_prio = None
                 self.starve_route = False
-                self._first_round_finished = False
                 self._start_check_routepools()
 
                 if not self._first_started:
@@ -197,7 +197,7 @@ class RouteManagerLeveling(RouteManagerQuests):
                     self.logger.info('There are less stops without quest than route positions - recalc')
                     self._recalc_stop_route(stops)
                 elif len(self._route) == 0 and len(stops) > 0:
-                    self.logger.warning("Something wrong with area: it have many new stops - you should delete "
+                    self.logger.warning("Something wrong with area: it has a lot of new stops - you should delete the "
                                         "routefile!!")
                     self.logger.info("Recalc new route for area")
                     self._recalc_stop_route(stops)
@@ -227,7 +227,8 @@ class RouteManagerLeveling(RouteManagerQuests):
         if self._is_started:
             self._is_started = False
             self._round_started_time = None
-            if self.init: self._first_started = False
+            if self.init:
+                self._first_started = False
             self._restore_original_route()
             self._shutdown_route = False
 
