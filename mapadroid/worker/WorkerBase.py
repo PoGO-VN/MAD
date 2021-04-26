@@ -654,7 +654,7 @@ class WorkerBase(AbstractWorker):
                 self.logger.debug("screendetection found pogo closed, start it...")
                 self._start_pogo()
                 self._loginerrorcounter += 1
-            elif screen_type in [ScreenType.GAMEDATA, ScreenType.CONSENT]:
+            elif screen_type == ScreenType.GAMEDATA:
                 self.logger.info('Error getting Gamedata or strange ggl message appears')
                 self._loginerrorcounter += 1
                 if self._loginerrorcounter < 2:
@@ -681,6 +681,9 @@ class WorkerBase(AbstractWorker):
             elif screen_type == ScreenType.SN:
                 self.logger.warning('Getting SN Screen - restart PoGo and later PD')
                 self._restart_pogo_safe()
+                break
+            elif screen_type == ScreenType.NOTRESPONDING:
+                self._reboot()
                 break
 
             if self._loginerrorcounter > 1:
